@@ -6,7 +6,8 @@ import threading
 from typing import Dict, Optional
 from telebot import TeleBot, types
 import genshin
-import enkanetwork
+from enkanetwork import EnkaNetworkAPI
+import aiohttp
 from io import BytesIO
 
 # إعدادات التسجيل
@@ -34,13 +35,6 @@ def init_db():
             user_id INTEGER PRIMARY KEY,
             genshin_uid INTEGER,
             cookie TEXT,
-            created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
-        )
-    ''')
-    c.execute('''
-        CREATE TABLE IF NOT EXISTS groups (
-            group_id INTEGER PRIMARY KEY,
-            settings TEXT,
             created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
         )
     ''')
@@ -137,9 +131,10 @@ def profile_command(message):
         # تشغيل الوظيفة غير المتزامنة في خيط منفصل
         def get_profile():
             async def async_get_profile():
-                async with enkanetwork.Client() as client:
-                    await client.update_assets()
-                    return await client.fetch_user(user_data['genshin_uid'])
+                async with aiohttp.ClientSession() as session:
+                    enka = EnkaNetworkAPI(session=session)
+                    await enka.update_assets()
+                    return await enka.fetch_user(user_data['genshin_uid'])
             return run_async(async_get_profile())
         
         player = get_profile()
@@ -156,11 +151,12 @@ def profile_command(message):
         
         bot.reply_to(message, profile_text)
     
-    except enkanetwork.utils.NotFound:
-        bot.reply_to(message, "لم يتم العثور على اللاعب. تأكد من صحة UID وإعدادات الخصوصية")
     except Exception as e:
         logger.error(f"Error in profile: {e}")
-        bot.reply_to(message, "حدث خطأ أثناء جلب البيانات")
+        if "Player not found" in str(e) or "404" in str(e):
+            bot.reply_to(message, "لم يتم العثور على اللاعب. تأكد من صحة UID وإعدادات الخصوصية")
+        else:
+            bot.reply_to(message, "حدث خطأ أثناء جلب البيانات")
 
 @bot.message_handler(commands=['characters'])
 def characters_command(message):
@@ -172,10 +168,10 @@ def characters_command(message):
         
         def get_chars():
             async def async_get_chars():
-                async with genshin.Client() as client:
-                    if user_data.get('cookie'):
-                        client.set_cookies(user_data['cookie'])
-                    return await client.get_characters(user_data['genshin_uid'])
+                client = genshin.Client()
+                if user_data.get('cookie'):
+                    client.set_cookies(user_data['cookie'])
+                return await client.get_characters(user_data['genshin_uid'])
             return run_async(async_get_chars())
         
         characters = get_chars()
@@ -206,16 +202,17 @@ def card_command(message):
         
         def generate_card():
             async def async_generate_card():
-                async with enkanetwork.Client() as client:
-                    await client.update_assets()
-                    player = await client.fetch_user(user_data['genshin_uid'])
+                async with aiohttp.ClientSession() as session:
+                    enka = EnkaNetworkAPI(session=session)
+                    await enka.update_assets()
+                    player = await enka.fetch_user(user_data['genshin_uid'])
                     
                     if not player.characters:
                         return None
                     
                     # توليد صورة للشخصية الأولى
                     character = player.characters[0]
-                    return await character.render()
+                    return await character.card.render()
             return run_async(async_generate_card())
         
         image = generate_card()
@@ -224,12 +221,16 @@ def card_command(message):
             bot.edit_message_text("لا توجد شخصيات لعرضها", message.chat.id, wait_msg.message_id)
             return
         
-        bot.delete_message(message.chat.id, wait_msg.message_id)
-        bot.send_photo(
-            message.chat.id, 
-            photo=image, 
-            caption=f"كارت الشخصية | تم الإنشاء"
-        )
+        # حفظ الصورة مؤقتاً وإرسالها
+        with BytesIO() as buffer:
+            image.save(buffer, format="PNG")
+            buffer.seek(0)
+            bot.delete_message(message.chat.id, wait_msg.message_id)
+            bot.send_photo(
+                message.chat.id, 
+                photo=buffer, 
+                caption=f"كارت الشخصية | تم الإنشاء"
+            )
     
     except Exception as e:
         logger.error(f"Error in card: {e}")
@@ -253,19 +254,27 @@ def resin_command(message):
         
         def get_notes():
             async def async_get_notes():
-                async with genshin.Client() as client:
-                    client.set_cookies(user_data['cookie'])
-                    return await client.get_notes(user_data['genshin_uid'])
+                client = genshin.Client()
+                client.set_cookies(user_data['cookie'])
+                return await client.get_notes(user_data['genshin_uid'])
             return run_async(async_get_notes())
         
         notes = get_notes()
         
+        # تحويل وقت الاسترداد إلى تنسيق مقروء
+        def format_time(seconds):
+            if seconds <= 0:
+                return "مكتمل"
+            hours, remainder = divmod(seconds, 3600)
+            minutes, _ = divmod(remainder, 60)
+            return f"{int(hours)} ساعة {int(minutes)} دقيقة"
+        
         resin_text = f"""
 ⚡ الريسِن الحالي: {notes.current_resin}/{notes.max_resin}
-⏳ وقت الامتلاء: {notes.remaining_resin_recovery_time}
+⏳ وقت الامتلاء: {format_time(notes.remaining_resin_recovery_time)}
 
 🎯 الباوند: {notes.current_realm_currency}/{notes.max_realm_currency}
-⏳ وقت امتلاء الباوند: {notes.remaining_realm_currency_recovery_time}
+⏳ وقت امتلاء الباوند: {format_time(notes.remaining_realm_currency_recovery_time)}
 
 📦 المهمات اليومية: {notes.completed_commissions}/{notes.max_commissions}
 🔄 إعادة التدوير: {notes.remaining_resin_discounts} مرات متبقية
