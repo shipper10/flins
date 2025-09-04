@@ -1,0 +1,8 @@
+python-telegram-bot==20.7
+genshin
+aiosqlite
+enka-py
+Pillow
+enkacard
+enkanetworkcard
+python-dotenv
