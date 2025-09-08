@@ -1,0 +1,35 @@
+from telegram import Update
+from telegram.ext import CommandHandler, ContextTypes
+from utils.mongo import users_collection, logs_collection
+from utils.escape import escape_text
+from datetime import datetime
+from genshin import GenshinClient
+
+async def resin(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    user_id = update.message.from_user.id
+    user_data = users_collection.find_one({"user_id": user_id})
+    if not user_data:
+        await update.message.reply_text("❌ أنت غير مسجل. استخدم /register أولاً في الخاص.")
+        return
+    try:
+        client = GenshinClient(
+            ltuid_v2=user_data.get("ltuid_v2"),
+            ltoken_v2=user_data.get("ltoken_v2"),
+            ltmid_v2=user_data.get("ltmid_v2"),
+            cookie_token_v2=user_data.get("cookie_token_v2")
+        )
+        notes = await client.get_daily_notes(int(user_data["UID"]))
+        msg = f"*🛡 Resin الحالي:* `{escape_text(notes.resin)}` | الوقت المتبقي: `{escape_text(notes.resin_recovery_time)}`"
+        await update.message.reply_text(msg, parse_mode="MarkdownV2")
+    except Exception as e:
+        logs_collection.insert_one({
+            "user_id": user_id,
+            "error": str(e),
+            "time": datetime.utcnow(),
+            "context": "/resin"
+        })
+        await update.message.reply_text("❌ حدث خطأ أثناء جلب بيانات Resin.")
+
+def resin_handler():
+    from telegram.ext import CommandHandler
+    return CommandHandler("resin", resin)
