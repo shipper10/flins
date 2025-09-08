@@ -9,3 +9,4 @@ python-dotenv
 pyTelegramBotAPI==4.14.0
 enkanetwork.py
 aiohttp
+pymongo
