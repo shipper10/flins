@@ -1,348 +1,319 @@
 import os
 import logging
-import sqlite3
-import asyncio
-import threading
-from typing import Dict, Optional
-from telebot import TeleBot, types
-import genshin
-from enkanetwork import EnkaNetworkAPI
-import aiohttp
-from io import BytesIO
+from datetime import datetime
+from telegram import InlineKeyboardButton, InlineKeyboardMarkup, Update
+from telegram.ext import ApplicationBuilder, CommandHandler, CallbackQueryHandler, MessageHandler, filters, ContextTypes
+from genshin import GenshinClient, AlreadyClaimed
+from genshin.models import DiaryType
+from pymongo import MongoClient
 
-# إعدادات التسجيل
-logging.basicConfig(
-    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
-    level=logging.INFO
-)
+# ---------------- Environment Variables ----------------
+BOT_TOKEN = os.getenv("BOT_TOKEN")
+MONGO_URI = os.getenv("MONGO_URI")
+
+# ---------------- MongoDB ----------------
+mongo_client = MongoClient(MONGO_URI)
+db = mongo_client.genshin_bot
+users_collection = db.users
+logs_collection = db.logs
+
+# ---------------- Logging ----------------
+logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
-# تهيئة البوت
-TOKEN = os.getenv('BOT_TOKEN')
-if not TOKEN:
-    logger.error("لم يتم تعيين BOT_TOKEN في متغيرات البيئة")
-    exit(1)
+# ---------------- Helpers ----------------
+def get_client(user_data):
+    return GenshinClient(
+        ltuid_v2=user_data.get("ltuid_v2"),
+        ltoken_v2=user_data.get("ltoken_v2"),
+        ltmid_v2=user_data.get("ltmid_v2"),
+        cookie_token_v2=user_data.get("cookie_token_v2")
+    )
 
-bot = TeleBot(TOKEN)
+# ---------------- Registration ----------------
+async def register(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    await update.message.reply_text(
+        "👤 تسجيل المستخدم:\n"
+        "يمكنك التسجيل عن طريق:\n"
+        "1️⃣ إدخال الكوكيز كاملة.\n"
+        "2️⃣ تسجيل الدخول بالبريد وكلمة السر.\n\n"
+        "اكتب 'cookies' أو 'login' للمتابعة."
+    )
 
-# تهيئة قاعدة البيانات
-def init_db():
-    os.makedirs('data', exist_ok=True)
-    conn = sqlite3.connect('data/users.db')
-    c = conn.cursor()
-    c.execute('''
-        CREATE TABLE IF NOT EXISTS users (
-            user_id INTEGER PRIMARY KEY,
-            genshin_uid INTEGER,
-            cookie TEXT,
-            created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+async def handle_register_input(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    text = update.message.text.lower()
+    if text == "cookies":
+        await update.message.reply_text(
+            "📌 أدخل الكوكيز بالترتيب:\n"
+            "ltuid_v2, ltoken_v2, ltmid_v2, cookie_token_v2\n"
+            "افصل بين كل قيمة بفاصلة."
         )
-    ''')
-    conn.commit()
-    conn.close()
-
-init_db()
-
-# وظائف مساعدة لقاعدة البيانات
-def get_user_data(user_id: int) -> Optional[Dict]:
-    conn = sqlite3.connect('data/users.db')
-    c = conn.cursor()
-    c.execute("SELECT genshin_uid, cookie FROM users WHERE user_id = ?", (user_id,))
-    result = c.fetchone()
-    conn.close()
-    
-    if result:
-        return {"genshin_uid": result[0], "cookie": result[1]}
-    return None
-
-def save_user_data(user_id: int, genshin_uid: int, cookie: str = None):
-    conn = sqlite3.connect('data/users.db')
-    c = conn.cursor()
-    
-    if cookie:
-        c.execute(
-            "INSERT OR REPLACE INTO users (user_id, genshin_uid, cookie) VALUES (?, ?, ?)",
-            (user_id, genshin_uid, cookie)
-        )
+        context.user_data["reg_method"] = "cookies"
+    elif text == "login":
+        await update.message.reply_text("📌 أدخل البريد الإلكتروني:")
+        context.user_data["reg_method"] = "login"
+        context.user_data["step"] = "email"
     else:
-        c.execute(
-            "INSERT OR REPLACE INTO users (user_id, genshin_uid) VALUES (?, ?)",
-            (user_id, genshin_uid)
-        )
-    
-    conn.commit()
-    conn.close()
+        await update.message.reply_text("❌ الرجاء كتابة 'cookies' أو 'login'.")
 
-# تشغيل الأوامر غير المتزامنة في خلفية
-def run_async(coro):
-    loop = asyncio.new_event_loop()
-    asyncio.set_event_loop(loop)
-    return loop.run_until_complete(coro)
-
-# معالجة الأوامر
-@bot.message_handler(commands=['start', 'help'])
-def send_welcome(message):
-    user_markup = types.ReplyKeyboardMarkup(resize_keyboard=True)
-    user_markup.row('👤 بروفايلي', '🎮 شخصياتي')
-    user_markup.row('🖼️ كروت الشخصيات', '⚙️ إعدادات')
-    
-    welcome_text = """
-مرحباً بك في بوت Genshin Impact! 🎮
-
-الأوامر المتاحة:
-/start - عرض هذه الرسالة
-/profile - عرض معلومات لاعبك
-/characters - عرض شخصياتك
-/card - إنشاء كارت لشخصية معينة
-/set_uid [UID] - تعيين UID الخاص بك
-/resin - فحص الريسِن الحالي
-/set_cookie [cookie] - تعيين cookie للوصول لبياناتك
-"""
-
-    bot.send_message(message.chat.id, welcome_text, reply_markup=user_markup)
-
-@bot.message_handler(commands=['set_uid'])
-def set_uid_command(message):
+async def handle_register_details(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    user_id = update.message.from_user.id
+    method = context.user_data.get("reg_method")
+    text = update.message.text.strip()
     try:
-        args = message.text.split()
-        if len(args) < 2:
-            bot.reply_to(message, "يرجى إضافة UID بعد الأمر: /set_uid 700000000")
-            return
-        
-        uid = int(args[1])
-        save_user_data(message.from_user.id, uid)
-        
-        bot.reply_to(message, f"تم حفظ UID: {uid} بنجاح! ✅")
-    
-    except ValueError:
-        bot.reply_to(message, "UID يجب أن يكون رقماً صحيحاً")
-    except Exception as e:
-        logger.error(f"Error in set_uid: {e}")
-        bot.reply_to(message, "حدث خطأ أثناء حفظ UID")
-
-@bot.message_handler(commands=['profile'])
-def profile_command(message):
-    try:
-        user_data = get_user_data(message.from_user.id)
-        if not user_data or not user_data['genshin_uid']:
-            bot.reply_to(message, "لم تقم بتعيين UID بعد. استخدم /set_uid [UID]")
-            return
-        
-        # تشغيل الوظيفة غير المتزامنة في خيط منفصل
-        def get_profile():
-            async def async_get_profile():
-                async with aiohttp.ClientSession() as session:
-                    enka = EnkaNetworkAPI(session=session)
-                    await enka.update_assets()
-                    return await enka.fetch_user(user_data['genshin_uid'])
-            return run_async(async_get_profile())
-        
-        player = get_profile()
-        
-        profile_text = f"""
-🎪 بروفايل اللاعب:
-الاسم: {player.nickname}
-المستوى: {player.level}
-العالم: {player.world_level}
-الإنجازات: {player.achievements}
-أبراج: {player.abyss_floor}-{player.abyss_room}
-عدد الشخصيات: {len(player.characters)}
-        """
-        
-        bot.reply_to(message, profile_text)
-    
-    except Exception as e:
-        logger.error(f"Error in profile: {e}")
-        if "Player not found" in str(e) or "404" in str(e):
-            bot.reply_to(message, "لم يتم العثور على اللاعب. تأكد من صحة UID وإعدادات الخصوصية")
+        if method == "cookies":
+            parts = [p.strip() for p in text.split(",")]
+            if len(parts) != 4:
+                await update.message.reply_text("❌ الرجاء إدخال جميع القيم الأربع للكوكيز.")
+                return
+            ltuid_v2, ltoken_v2, ltmid_v2, cookie_token_v2 = parts
+            client = GenshinClient(ltuid_v2=ltuid_v2, ltoken_v2=ltoken_v2, ltmid_v2=ltmid_v2, cookie_token_v2=cookie_token_v2)
+        elif method == "login":
+            step = context.user_data.get("step")
+            if step == "email":
+                context.user_data["email"] = text
+                context.user_data["step"] = "password"
+                await update.message.reply_text("📌 أدخل كلمة المرور:")
+                return
+            elif step == "password":
+                email = context.user_data.get("email")
+                password = text
+                client = GenshinClient(email=email, password=password)
         else:
-            bot.reply_to(message, "حدث خطأ أثناء جلب البيانات")
-
-@bot.message_handler(commands=['characters'])
-def characters_command(message):
-    try:
-        user_data = get_user_data(message.from_user.id)
-        if not user_data or not user_data['genshin_uid']:
-            bot.reply_to(message, "لم تقم بتعيين UID بعد. استخدم /set_uid [UID]")
+            await update.message.reply_text("❌ خطأ في طريقة التسجيل.")
             return
-        
-        def get_chars():
-            async def async_get_chars():
-                client = genshin.Client()
-                if user_data.get('cookie'):
-                    client.set_cookies(user_data['cookie'])
-                return await client.get_characters(user_data['genshin_uid'])
-            return run_async(async_get_chars())
-        
-        characters = get_chars()
-        
-        characters_text = "شخصياتك: \n\n"
-        for char in characters[:10]:  # عرض أول 10 شخصيات فقط
-            characters_text += f"{char.name} - المستوى {char.level} - ⭐{char.rarity}\n"
-        
-        if len(characters) > 10:
-            characters_text += f"\nو {len(characters) - 10} شخصية أخرى..."
-        
-        bot.reply_to(message, characters_text)
-    
+
+        user_info = await client.get_partial_genshin_user(client.user_id)
+        users_collection.update_one(
+            {"user_id": user_id},
+            {"$set": {
+                "user_id": user_id,
+                "UID": str(client.user_id),
+                "ltuid_v2": getattr(client, "ltuid_v2", ""),
+                "ltoken_v2": getattr(client, "ltoken_v2", ""),
+                "ltmid_v2": getattr(client, "ltmid_v2", ""),
+                "cookie_token_v2": getattr(client, "cookie_token_v2", "")
+            }},
+            upsert=True
+        )
+        await update.message.reply_text(f"✅ تم التسجيل بنجاح! UID: `{client.user_id}`", parse_mode="MarkdownV2")
     except Exception as e:
-        logger.error(f"Error in characters: {e}")
-        bot.reply_to(message, "حدث خطأ أثناء جلب الشخصيات")
+        logger.error(f"خطأ أثناء التسجيل للمستخدم {user_id}: {e}")
+        await update.message.reply_text(f"❌ حدث خطأ أثناء التسجيل: {e}")
 
-@bot.message_handler(commands=['card'])
-def card_command(message):
+# ---------------- /profile ----------------
+async def profile(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    user_id = update.message.from_user.id
+    user_data = users_collection.find_one({"user_id": user_id})
+    if not user_data:
+        await update.message.reply_text("❌ أنت غير مسجل. استخدم /register أولاً في الخاص.")
+        return
     try:
-        user_data = get_user_data(message.from_user.id)
-        if not user_data or not user_data['genshin_uid']:
-            bot.reply_to(message, "لم تقم بتعيين UID بعد. استخدم /set_uid [UID]")
-            return
-        
-        # إرسال رسالة انتظار
-        wait_msg = bot.reply_to(message, "⏳ جاري إنشاء الكارت...")
-        
-        def generate_card():
-            async def async_generate_card():
-                async with aiohttp.ClientSession() as session:
-                    enka = EnkaNetworkAPI(session=session)
-                    await enka.update_assets()
-                    player = await enka.fetch_user(user_data['genshin_uid'])
-                    
-                    if not player.characters:
-                        return None
-                    
-                    # توليد صورة للشخصية الأولى
-                    character = player.characters[0]
-                    return await character.card.render()
-            return run_async(async_generate_card())
-        
-        image = generate_card()
-        
-        if image is None:
-            bot.edit_message_text("لا توجد شخصيات لعرضها", message.chat.id, wait_msg.message_id)
-            return
-        
-        # حفظ الصورة مؤقتاً وإرسالها
-        with BytesIO() as buffer:
-            image.save(buffer, format="PNG")
-            buffer.seek(0)
-            bot.delete_message(message.chat.id, wait_msg.message_id)
-            bot.send_photo(
-                message.chat.id, 
-                photo=buffer, 
-                caption=f"كارت الشخصية | تم الإنشاء"
-            )
-    
+        client = get_client(user_data)
+        user = await client.get_partial_genshin_user(int(user_data["UID"]))
+        msg = (
+            f"*👤 بيانات المستخدم:*\n"
+            f"- Adventure Rank: `{user.stats.adventure_rank}`\n"
+            f"- عدد الشخصيات: `{len(user.characters)}`\n"
+        )
+        await update.message.reply_text(msg, parse_mode="MarkdownV2")
     except Exception as e:
-        logger.error(f"Error in card: {e}")
-        bot.reply_to(message, "حدث خطأ أثناء إنشاء الكارت")
+        logger.error(f"خطأ في /profile للمستخدم {user_id}: {e}")
+        logs_collection.insert_one({"user_id": user_id, "error": str(e), "time": datetime.utcnow(), "context": "/profile"})
+        await update.message.reply_text("❌ حدث خطأ أثناء جلب بيانات الملف الشخصي.")
 
-@bot.message_handler(commands=['resin'])
-def resin_command(message):
+# ---------------- /characters ----------------
+async def characters(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    user_id = update.message.from_user.id
+    user_data = users_collection.find_one({"user_id": user_id})
+    if not user_data:
+        await update.message.reply_text("❌ أنت غير مسجل. استخدم /register أولاً في الخاص.")
+        return
     try:
-        user_data = get_user_data(message.from_user.id)
-        if not user_data or not user_data['genshin_uid']:
-            bot.reply_to(message, "لم تقم بتعيين UID بعد. استخدم /set_uid [UID]")
-            return
-        
-        # إذا لم يكن هناك cookie، نطلب من المستخدم إضافته
-        if not user_data.get('cookie'):
-            bot.reply_to(
-                message, 
-                "لم يتم تعيين cookie. لإضافة cookie استخدم:\n/set_cookie [cookie_text]\n\nملاحظة: يمكن الحصول على cookie من موقع Hoyolab"
-            )
-            return
-        
-        def get_notes():
-            async def async_get_notes():
-                client = genshin.Client()
-                client.set_cookies(user_data['cookie'])
-                return await client.get_notes(user_data['genshin_uid'])
-            return run_async(async_get_notes())
-        
-        notes = get_notes()
-        
-        # تحويل وقت الاسترداد إلى تنسيق مقروء
-        def format_time(seconds):
-            if seconds <= 0:
-                return "مكتمل"
-            hours, remainder = divmod(seconds, 3600)
-            minutes, _ = divmod(remainder, 60)
-            return f"{int(hours)} ساعة {int(minutes)} دقيقة"
-        
-        resin_text = f"""
-⚡ الريسِن الحالي: {notes.current_resin}/{notes.max_resin}
-⏳ وقت الامتلاء: {format_time(notes.remaining_resin_recovery_time)}
-
-🎯 الباوند: {notes.current_realm_currency}/{notes.max_realm_currency}
-⏳ وقت امتلاء الباوند: {format_time(notes.remaining_realm_currency_recovery_time)}
-
-📦 المهمات اليومية: {notes.completed_commissions}/{notes.max_commissions}
-🔄 إعادة التدوير: {notes.remaining_resin_discounts} مرات متبقية
-        """
-        
-        bot.reply_to(message, resin_text)
-    
+        client = get_client(user_data)
+        chars = await client.get_characters(int(user_data["UID"]))
+        msg = "*🗡 شخصياتك:*\n"
+        for c in chars:
+            msg += f"- {c.name} Lv.{c.level} | C{c.constellation} | {c.weapon.name}\n"
+        await update.message.reply_text(msg, parse_mode="MarkdownV2")
     except Exception as e:
-        logger.error(f"Error in resin: {e}")
-        bot.reply_to(message, "حدث خطأ أثناء جلب بيانات الريسِن. تأكد من صحة cookie")
+        logger.error(f"خطأ في /characters للمستخدم {user_id}: {e}")
+        logs_collection.insert_one({"user_id": user_id, "error": str(e), "time": datetime.utcnow(), "context": "/characters"})
+        await update.message.reply_text("❌ حدث خطأ أثناء جلب بيانات الشخصيات.")
 
-@bot.message_handler(commands=['set_cookie'])
-def set_cookie_command(message):
+# ---------------- /abyss ----------------
+async def abyss(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    user_id = update.message.from_user.id
+    user_data = users_collection.find_one({"user_id": user_id})
+    if not user_data:
+        await update.message.reply_text("❌ أنت غير مسجل. استخدم /register أولاً في الخاص.")
+        return
     try:
-        args = message.text.split(maxsplit=1)
-        if len(args) < 2:
-            bot.reply_to(message, "يرجى إضافة cookie بعد الأمر: /set_cookie [cookie_text]")
-            return
-        
-        cookie = args[1]
-        user_data = get_user_data(message.from_user.id)
-        
-        if not user_data or not user_data['genshin_uid']:
-            bot.reply_to(message, "يجب تعيين UID أولاً باستخدام /set_uid [UID]")
-            return
-        
-        save_user_data(message.from_user.id, user_data['genshin_uid'], cookie)
-        bot.reply_to(message, "تم حفظ cookie بنجاح! ✅")
-    
+        client = get_client(user_data)
+        current = await client.get_spiral_abyss(int(user_data["UID"]))
+        prev = await client.get_spiral_abyss(int(user_data["UID"]), previous=True)
+        msg = (
+            f"*🌀 Spiral Abyss الحالي:*\n"
+            f"- Stars: `{current.total_stars}`\n"
+            f"- Floors: `{len(current.floors)}`\n\n"
+            f"*↩ Spiral Abyss السابق:*\n"
+            f"- Stars: `{prev.total_stars}`\n"
+            f"- Floors: `{len(prev.floors)}`\n"
+        )
+        keyboard = [
+            [InlineKeyboardButton("⬅ السابق", callback_data="abyss_previous")],
+            [InlineKeyboardButton("➡ الحالي", callback_data="abyss_current")]
+        ]
+        reply_markup = InlineKeyboardMarkup(keyboard)
+        await update.message.reply_text(msg, parse_mode="MarkdownV2", reply_markup=reply_markup)
     except Exception as e:
-        logger.error(f"Error in set_cookie: {e}")
-        bot.reply_to(message, "حدث خطأ أثناء حفظ cookie")
+        logger.error(f"خطأ في /abyss للمستخدم {user_id}: {e}")
+        logs_collection.insert_one({"user_id": user_id, "error": str(e), "time": datetime.utcnow(), "context": "/abyss"})
+        await update.message.reply_text("❌ حدث خطأ أثناء جلب بيانات Spiral Abyss.")
 
-# معالجة الأزرار
-@bot.message_handler(func=lambda message: message.text == '👤 بروفايلي')
-def profile_button(message):
-    profile_command(message)
+# ---------------- /resin ----------------
+async def resin(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    user_id = update.message.from_user.id
+    user_data = users_collection.find_one({"user_id": user_id})
+    if not user_data:
+        await update.message.reply_text("❌ أنت غير مسجل. استخدم /register أولاً في الخاص.")
+        return
+    try:
+        client = get_client(user_data)
+        notes = await client.get_daily_notes(int(user_data["UID"]))
+        msg = f"*🛡 Resin الحالي:* `{notes.resin}` | الوقت المتبقي: `{notes.resin_recovery_time}`"
+        await update.message.reply_text(msg, parse_mode="MarkdownV2")
+    except Exception as e:
+        logger.error(f"خطأ في /resin للمستخدم {user_id}: {e}")
+        logs_collection.insert_one({"user_id": user_id, "error": str(e), "time": datetime.utcnow(), "context": "/resin"})
+        await update.message.reply_text("❌ حدث خطأ أثناء جلب بيانات Resin.")
 
-@bot.message_handler(func=lambda message: message.text == '🎮 شخصياتي')
-def characters_button(message):
-    characters_command(message)
+# ---------------- /resources_diary ----------------
+async def resources_diary(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    user_id = update.message.from_user.id
+    user_data = users_collection.find_one({"user_id": user_id})
+    if not user_data:
+        await update.message.reply_text("❌ أنت غير مسجل. استخدم /register أولاً في الخاص.")
+        return
+    try:
+        client = get_client(user_data)
+        notes = await client.get_daily_notes(int(user_data["UID"]))
+        msg = (
+            f"💎 *Primogems الحالية:* `{notes.primogems}`\n"
+            f"💰 *Mora الحالية:* `{notes.mora}`\n"
+            f"\nاختر المورد لعرض إحصائياته التاريخية:"
+        )
+        keyboard = [
+            [InlineKeyboardButton("💎 Primogems", callback_data="resource_primogems")],
+            [InlineKeyboardButton("💰 Mora", callback_data="resource_mora")]
+        ]
+        reply_markup = InlineKeyboardMarkup(keyboard)
+        await update.message.reply_text(msg, parse_mode="MarkdownV2", reply_markup=reply_markup)
+    except Exception as e:
+        logger.error(f"خطأ في resources_diary للمستخدم {user_id}: {e}")
+        logs_collection.insert_one({"user_id": user_id, "error": str(e), "time": datetime.utcnow(), "context": "resources_diary"})
+        await update.message.reply_text("❌ حدث خطأ أثناء جلب بيانات الموارد.")
 
-@bot.message_handler(func=lambda message: message.text == '🖼️ كروت الشخصيات')
-def card_button(message):
-    card_command(message)
+async def resources_diary_button(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.answer()
+    user_id = query.from_user.id
+    user_data = users_collection.find_one({"user_id": user_id})
+    try:
+        client = get_client(user_data)
+        if query.data in ["resource_primogems", "resource_mora"]:
+            keyboard = [
+                [InlineKeyboardButton("🗓 آخر أسبوع", callback_data=f"{query.data}_week")],
+                [InlineKeyboardButton("📅 آخر شهر", callback_data=f"{query.data}_month")],
+                [InlineKeyboardButton("📆 آخر 3 أشهر", callback_data=f"{query.data}_3months")]
+            ]
+            reply_markup = InlineKeyboardMarkup(keyboard)
+            await query.edit_message_text("اختر الفترة الزمنية:", reply_markup=reply_markup)
+            return
+        data_parts = query.data.split("_")
+        resource = data_parts[1]
+        period = data_parts[2]
+        msg = ""
+        if resource == "primogems":
+            diary = await client.get_diary()
+            msg += f"💎 *Primogems المكتسبة ({period}):* `{diary.data.current_primogems}`\n\n"
+            msg += "*🔹 مصادر Primogems:*\n"
+            for cat in diary.data.categories:
+                msg += f"- {cat.percentage}% من {cat.name} (`{cat.amount}` primogems)\n"
+        elif resource == "mora":
+            msg += f"💰 *سجل Mora ({period}):*\n"
+            async for action in client.diary_log(limit=50, type=DiaryType.MORA):
+                msg += f"- {action.action} : `{action.amount}` mora\n"
+        await query.edit_message_text(msg, parse_mode="MarkdownV2")
+    except Exception as e:
+        logger.error(f"خطأ في resources_diary_button للمستخدم {user_id}: {e}")
+        logs_collection.insert_one({"user_id": user_id, "error": str(e), "time": datetime.utcnow(), "context": "resources_diary_button"})
+        await query.edit_message_text("❌ حدث خطأ أثناء جلب بيانات الموارد التاريخية.")
 
-@bot.message_handler(func=lambda message: message.text == '⚙️ إعدادات')
-def settings_button(message):
-    user_data = get_user_data(message.from_user.id)
-    
-    if user_data and user_data['genshin_uid']:
-        settings_text = f"""
-الإعدادات الحالية:
-UID: {user_data['genshin_uid']}
-Cookie: {'✅ معين' if user_data.get('cookie') else '❌ غير معين'}
-        """
-    else:
-        settings_text = "لم تقم بتعيين UID بعد. استخدم /set_uid [UID]"
-    
-    bot.reply_to(message, settings_text)
+# ---------------- /daily_rewards ----------------
+async def daily_rewards(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    user_id = update.message.from_user.id
+    user_data = users_collection.find_one({"user_id": user_id})
+    if not user_data:
+        await update.message.reply_text("❌ أنت غير مسجل. استخدم /register أولاً في الخاص.")
+        return
+    try:
+        client = get_client(user_data)
+        signed_in, claimed_count = await client.get_reward_info()
+        status = "✅ تم تسجيل الدخول اليومي" if signed_in else "❌ لم يتم تسجيل الدخول اليوم"
+        msg = f"*📊 حالة المكافأة اليومية:*\n{status}\n*عدد المكافآت المطالبة:* `{claimed_count}`"
+        keyboard = [
+            [InlineKeyboardButton("🎁 المطالبة بالمكافأة اليومية", callback_data="claim_daily")],
+            [InlineKeyboardButton("📜 عرض المكافآت المطالبة", callback_data="view_claimed")]
+        ]
+        reply_markup = InlineKeyboardMarkup(keyboard)
+        await update.message.reply_text(msg, parse_mode="MarkdownV2", reply_markup=reply_markup)
+    except Exception as e:
+        logger.error(f"خطأ في daily_rewards للمستخدم {user_id}: {e}")
+        logs_collection.insert_one({"user_id": user_id, "error": str(e), "time": datetime.utcnow(), "context": "daily_rewards"})
+        await update.message.reply_text("❌ حدث خطأ أثناء جلب حالة المكافآت اليومية.")
 
-# معالجة الأخطاء العامة
-@bot.message_handler(func=lambda message: True)
-def echo_all(message):
-    if message.chat.type == 'private':
-        bot.reply_to(message, "لم أفهم طلبك. استخدم الأزرار أو الأوامر المتاحة.")
+async def daily_rewards_button(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.answer()
+    user_id = query.from_user.id
+    user_data = users_collection.find_one({"user_id": user_id})
+    try:
+        client = get_client(user_data)
+        if query.data == "claim_daily":
+            try:
+                reward = await client.claim_daily_reward()
+                msg = f"✅ تم المطالبة بالمكافأة اليومية: {reward.amount}x {reward.name}"
+            except AlreadyClaimed:
+                msg = "⚠️ تم المطالبة بالمكافأة اليومية بالفعل اليوم."
+            await query.edit_message_text(msg)
+        elif query.data == "view_claimed":
+            msg = "*📜 المكافآت المطالبة سابقًا:*\n"
+            async for reward in client.claimed_rewards():
+                msg += f"- {reward.time} : {reward.amount}x {reward.name}\n"
+            await query.edit_message_text(msg, parse_mode="MarkdownV2")
+    except Exception as e:
+        logger.error(f"خطأ في daily_rewards_button للمستخدم {user_id}: {e}")
+        logs_collection.insert_one({"user_id": user_id, "error": str(e), "time": datetime.utcnow(), "context": "daily_rewards_button"})
+        await query.edit_message_text("❌ حدث خطأ أثناء تنفيذ العملية.")
 
-# تشغيل البوت
-if __name__ == '__main__':
-    logger.info("Starting bot...")
-    bot.infinity_polling()
+# ---------------- Handlers ----------------
+app = ApplicationBuilder().token(BOT_TOKEN).build()
+
+# Registration
+app.add_handler(CommandHandler("register", register))
+app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_register_input))
+app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_register_details))
+
+# Commands
+app.add_handler(CommandHandler("profile", profile))
+app.add_handler(CommandHandler("characters", characters))
+app.add_handler(CommandHandler("abyss", abyss))
+app.add_handler(CommandHandler("resin", resin))
+app.add_handler(CommandHandler("resources_diary", resources_diary))
+app.add_handler(CallbackQueryHandler(resources_diary_button, pattern="^resource_(primogems|mora)(_week|_month|_3months)?$"))
+app.add_handler(CommandHandler("daily_rewards", daily_rewards))
+app.add_handler(CallbackQueryHandler(daily_rewards_button, pattern="^(claim_daily|view_claimed)$"))
+
+# ---------------- Run Bot ----------------
+app.run_polling()
